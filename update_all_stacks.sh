@@ -4,8 +4,12 @@
 # unused images. Every log entry is written as a single JSON line (JSONL) so the
 # file can be shipped straight to OpenObserve.
 #
+# Logs go to one file per day (logs/stack_updates-YYYY-MM-DD.json.log); files older than
+# LOG_RETENTION_DAYS are deleted at the start of each run.
+#
 # Optional environment overrides:
-#   LOG_FILE          Path of the JSON log file
+#   LOG_DIR             Directory for the daily log files (default: <script dir>/logs)
+#   LOG_RETENTION_DAYS  Days of log files to keep, including today (default: 5)
 #   LOG_ENVIRONMENT   Value of the "environment" field (default: PROD)
 #   LOG_SERVICE_NAME  Value of the "serviceName" field (default: update-docker-stacks-<host>)
 #   TRACE_ID          Reuse an existing trace id (e.g. when called from another job)
@@ -13,13 +17,16 @@
 
 # Resolve the absolute directory where this script resides to ensure relative paths work in cron
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/stack_updates.json.log}"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
+LOG_PREFIX="stack_updates-"
+LOG_SUFFIX=".json.log"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-5}"
+LOG_FILE="${LOG_DIR}/${LOG_PREFIX}$(date +%F)${LOG_SUFFIX}"
 
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Ensure the logs directory exists
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$LOG_DIR"
 
 HOST="$(hostname -s 2>/dev/null || hostname)"
 RUN_USER="$(id -un 2>/dev/null || echo "${USER:-unknown}")"
@@ -177,6 +184,47 @@ json_str_array() {
     printf '[%s]' "${out#,}"
 }
 
+# Delete daily log files older than LOG_RETENTION_DAYS (today counts as day 1).
+# Dates are taken from the file name, so only files this script created are touched.
+cleanup_old_logs() {
+    if ! [[ "$LOG_RETENTION_DAYS" =~ ^[1-9][0-9]*$ ]]; then
+        log_event WARN "Log cleanup skipped: LOG_RETENTION_DAYS '${LOG_RETENTION_DAYS}' is not a positive number" \
+            "$(json_obj "host=$HOST" "logDir=$LOG_DIR")" "LogCleanupSkipped"
+        return 0
+    fi
+
+    # Oldest date to keep; anything earlier is deleted (ISO dates compare correctly as strings)
+    local keep_from f file_date
+    local -a deleted=() failed=()
+    keep_from=$(date -d "-$((LOG_RETENTION_DAYS - 1)) days" +%F)
+
+    for f in "$LOG_DIR/$LOG_PREFIX"*"$LOG_SUFFIX"; do
+        [ -e "$f" ] || continue
+        file_date=${f##*/"$LOG_PREFIX"}
+        file_date=${file_date%"$LOG_SUFFIX"}
+        [[ "$file_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+
+        if [[ "$file_date" < "$keep_from" ]]; then
+            if rm -f -- "$f"; then
+                deleted+=("${f##*/}")
+            else
+                failed+=("${f##*/}")
+            fi
+        fi
+    done
+
+    local payload
+    payload=$(json_obj "host=$HOST" "logDir=$LOG_DIR" "retentionDays:=$LOG_RETENTION_DAYS" \
+        "keepFrom=$keep_from" "deletedFiles:=$(json_str_array "${deleted[@]}")" \
+        "failedFiles:=$(json_str_array "${failed[@]}")")
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+        log_event WARN "Log cleanup could not delete ${#failed[@]} file(s)" "$payload" "LogCleanupFailed"
+    elif [ "${#deleted[@]}" -gt 0 ]; then
+        log_event INFO "Log cleanup deleted ${#deleted[@]} file(s) older than ${keep_from}" "$payload"
+    fi
+}
+
 short_id() {
     local id=${1#sha256:}
     printf '%s' "${id:0:12}"
@@ -301,6 +349,7 @@ log_event INFO "Run started on ${HOST}" "$(json_obj \
     "dockerVersion=$DOCKER_VERSION" \
     "composeVersion=$COMPOSE_VERSION")"
 console "Trace ID: ${TRACE_ID}  (full JSON log: ${LOG_FILE})"
+cleanup_old_logs
 
 if ! compose_json=$(docker compose ls --format json 2>&1); then
     log_event ERROR "Unable to list running compose projects" \
