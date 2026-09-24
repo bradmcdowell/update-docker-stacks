@@ -177,43 +177,112 @@ json_str_array() {
     printf '[%s]' "${out#,}"
 }
 
-# find_outdated_containers STACK_NAME CONTEXT_ARRAY_NAME
-# Run inside a stack dir after a pull. Compares the image each running container was
-# started from with the image its tag now points to, and logs the containers that differ.
-# Sets OUTDATED_CONTAINERS to the names of the containers needing an update.
-find_outdated_containers() {
+short_id() {
+    local id=${1#sha256:}
+    printf '%s' "${id:0:12}"
+}
+
+# describe_image IMAGE_ID
+# Sets IMG_VERSION (from OCI / label-schema labels, may be empty), IMG_CREATED (YYYY-MM-DD)
+# and IMG_LABEL (human-readable "version, built date" or "id, built date").
+describe_image() {
+    local oci schema created
+    IFS='|' read -r oci schema created < <(docker image inspect -f \
+        '{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "org.label-schema.version"}}|{{.Created}}' \
+        "$1" 2>/dev/null < /dev/null)
+    [ "$oci" = "<no value>" ] && oci=""
+    [ "$schema" = "<no value>" ] && schema=""
+    IMG_VERSION=${oci:-$schema}
+    IMG_CREATED=${created%%T*}
+    IMG_LABEL="${IMG_VERSION:-id $(short_id "$1")}, built ${IMG_CREATED:-unknown}"
+}
+
+# check_containers STACK_NAME CONTEXT_ARRAY_NAME
+# Run inside a stack dir after a pull. For every running container, compares the image it
+# was started from with the image its tag now points to and logs one line per container,
+# then a stack-level summary.
+# Sets OUTDATED_CONTAINERS (names) and PENDING_IMAGE / PENDING_CHANGE (keyed by name)
+# for verify_updates.
+check_containers() {
     local stack=$1
     local -n ctx_ref="$2"
     OUTDATED_CONTAINERS=()
+    declare -gA PENDING_IMAGE=() PENDING_CHANGE=()
 
-    local entries="" cid name ref running_id latest_id
+    local entries="" checked=0 cid name ref running_id latest_id
+    local status cur_version cur_created cur_label new_version new_created new_label log_msg payload
+    local -a detail
     while IFS= read -r cid; do
         [ -n "$cid" ] || continue
         IFS='|' read -r name ref running_id \
             < <(docker inspect -f '{{.Name}}|{{.Config.Image}}|{{.Image}}' "$cid" 2>/dev/null < /dev/null)
         name=${name#/}
         latest_id=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null < /dev/null)
+        checked=$((checked + 1))
 
-        if [ -n "$latest_id" ] && [ "$latest_id" != "$running_id" ]; then
+        describe_image "$running_id"
+        cur_version=$IMG_VERSION cur_created=$IMG_CREATED cur_label=$IMG_LABEL
+        new_version="" new_created="" new_label=""
+
+        if [ -z "$latest_id" ]; then
+            status="unknown"
+            log_msg="[${stack}] ${name} (${ref}): could not resolve image tag, running ${cur_label}"
+        elif [ "$latest_id" = "$running_id" ]; then
+            status="up-to-date"
+            log_msg="[${stack}] ${name} (${ref}): up to date, ${cur_label}"
+        else
+            status="update-available"
+            describe_image "$latest_id"
+            new_version=$IMG_VERSION new_created=$IMG_CREATED new_label=$IMG_LABEL
+            log_msg="[${stack}] ${name} (${ref}): update available, ${cur_label} -> ${new_label}"
             OUTDATED_CONTAINERS+=("$name")
-            entries+=",$(json_obj "container=$name" "image=$ref" \
-                "runningImageId=${running_id#sha256:}" "latestImageId=${latest_id#sha256:}")"
+            PENDING_IMAGE[$name]=$latest_id
+            PENDING_CHANGE[$name]="${cur_label} -> ${new_label}"
         fi
+
+        detail=("container=$name" "image=$ref" "status=$status" \
+            "runningImageId=${running_id#sha256:}" "runningVersion=$cur_version" "runningImageCreated=$cur_created" \
+            "latestImageId=${latest_id#sha256:}" "latestVersion=$new_version" "latestImageCreated=$new_created")
+        entries+=",$(json_obj "${detail[@]}")"
+        log_event INFO "$log_msg" "$(json_obj "${ctx_ref[@]}" "${detail[@]}")"
     done < <(docker compose ps -q 2>/dev/null < /dev/null)
 
     local count=${#OUTDATED_CONTAINERS[@]}
-    local payload
     payload=$(json_obj "${ctx_ref[@]}" \
+        "containersChecked:=$checked" \
         "containersNeedingUpdateCount:=$count" \
-        "containersNeedingUpdate:=[${entries#,}]")
+        "containers:=[${entries#,}]")
 
     if [ "$count" -gt 0 ]; then
         local joined
         printf -v joined '%s, ' "${OUTDATED_CONTAINERS[@]}"
-        log_event INFO "Stack ${stack}: ${count} container(s) need updating: ${joined%, }" "$payload"
+        log_event INFO "Stack ${stack}: ${count} of ${checked} container(s) need updating: ${joined%, }" "$payload"
     else
-        log_event INFO "Stack ${stack}: all containers up to date" "$payload"
+        log_event INFO "Stack ${stack}: all ${checked} container(s) up to date" "$payload"
     fi
+}
+
+# verify_updates STACK_NAME CONTEXT_ARRAY_NAME
+# Run after `up -d`. Confirms each outdated container is now running the new image.
+# Sets UPDATED_CONTAINERS to the names that were successfully updated.
+verify_updates() {
+    local stack=$1
+    local -n ctx_ref="$2"
+    UPDATED_CONTAINERS=()
+
+    local name now_id payload
+    for name in "${OUTDATED_CONTAINERS[@]}"; do
+        now_id=$(docker inspect -f '{{.Image}}' "$name" 2>/dev/null < /dev/null)
+        payload=$(json_obj "${ctx_ref[@]}" "container=$name" \
+            "expectedImageId=${PENDING_IMAGE[$name]#sha256:}" "runningImageId=${now_id#sha256:}" \
+            "change=${PENDING_CHANGE[$name]}")
+        if [ "$now_id" = "${PENDING_IMAGE[$name]}" ]; then
+            UPDATED_CONTAINERS+=("$name")
+            log_event INFO "[${stack}] ${name} updated: ${PENDING_CHANGE[$name]}" "$payload"
+        else
+            log_event WARN "[${stack}] ${name} is still running the old image after deploy" "$payload" "UpdateNotApplied"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -244,6 +313,7 @@ stacks_ok=0
 failed_stacks=()
 stacks_needing_update=()
 updates_json=""    # "stack":["container",...] pairs for the summary
+containers_updated=0
 
 # Each running compose project is one {...} object in the JSON array
 while IFS= read -r entry; do
@@ -276,9 +346,12 @@ while IFS= read -r entry; do
     fi
 
     OUTDATED_CONTAINERS=()
+    UPDATED_CONTAINERS=()
     if run_logged "PullFailed" "Image pull for ${project}" stack_ctx -- docker compose --ansi never pull \
-        && find_outdated_containers "$project" stack_ctx \
+        && check_containers "$project" stack_ctx \
         && run_logged "DeployFailed" "Deploy of ${project}" stack_ctx -- docker compose --ansi never up -d; then
+        verify_updates "$project" stack_ctx
+        containers_updated=$((containers_updated + ${#UPDATED_CONTAINERS[@]}))
         stacks_ok=$((stacks_ok + 1))
         stack_status="success"
         stack_severity=INFO
@@ -296,6 +369,7 @@ while IFS= read -r entry; do
     log_event "$stack_severity" "Stack ${project} finished: ${stack_status}" "$(json_obj "${stack_ctx[@]}" \
         "status=$stack_status" \
         "containersNeedingUpdate:=$(json_str_array "${OUTDATED_CONTAINERS[@]}")" \
+        "containersUpdated:=$(json_str_array "${UPDATED_CONTAINERS[@]}")" \
         "durationMs:=$(( $(now_ms) - stack_start ))")" \
         "$([ "$stack_status" = failed ] && echo StackUpdateFailed)"
 
@@ -327,7 +401,7 @@ else
 fi
 
 log_event "$summary_severity" \
-    "Run completed on ${HOST}: ${stacks_ok}/${stacks_total} stacks processed, ${#stacks_needing_update[@]} had updates, ${#failed_stacks[@]} failed" \
+    "Run completed on ${HOST}: ${stacks_ok}/${stacks_total} stacks processed, ${#stacks_needing_update[@]} had updates, ${containers_updated} container(s) updated, ${#failed_stacks[@]} failed" \
     "$(json_obj \
         "host=$HOST" \
         "stacksTotal:=$stacks_total" \
@@ -335,6 +409,7 @@ log_event "$summary_severity" \
         "stacksFailed:=${#failed_stacks[@]}" \
         "failedStacks:=$(json_str_array "${failed_stacks[@]}")" \
         "stacksNeedingUpdate:={${updates_json#,}}" \
+        "containersUpdated:=$containers_updated" \
         "durationMs:=$(( $(now_ms) - RUN_START ))")" \
     "$summary_type"
 console "Trace ID: ${TRACE_ID}"
