@@ -108,9 +108,26 @@ log_event() {
         "$(json_escape "$message")")
 
     printf '%s\n' "$line" >> "$LOG_FILE"
-    # Echo to the terminal when run by hand (cron has no TTY)
-    [ -t 1 ] && printf '%s\n' "$line"
+
+    local color=""
+    case "$severity" in
+        WARN)  color=$'\e[33m' ;;
+        ERROR) color=$'\e[31m' ;;
+    esac
+    console "$message" "$color"
     return 0
+}
+
+# console MESSAGE [COLOR]
+# Human-readable line (local time + message) when run by hand; cron has no TTY so prints nothing.
+console() {
+    [ -t 1 ] || return 0
+    local color=${2:-}
+    if [ -n "$color" ]; then
+        printf '%s  %s%s\e[0m\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$color" "$1"
+    else
+        printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+    fi
 }
 
 # Start a child span of the run span
@@ -166,6 +183,7 @@ log_event INFO "Run started on ${HOST}" "$(json_obj \
     "bashVersion=$BASH_VERSION" \
     "dockerVersion=$DOCKER_VERSION" \
     "composeVersion=$COMPOSE_VERSION")"
+console "Trace ID: ${TRACE_ID}  (full JSON log: ${LOG_FILE})"
 
 if ! compose_json=$(docker compose ls --format json 2>&1); then
     log_event ERROR "Unable to list running compose projects" \
@@ -257,5 +275,6 @@ log_event "$summary_severity" \
         "failedStacks:=$failed_json" \
         "durationMs:=$(( $(now_ms) - RUN_START ))")" \
     "$summary_type"
+console "Trace ID: ${TRACE_ID}"
 
 [ "${#failed_stacks[@]}" -eq 0 ]
