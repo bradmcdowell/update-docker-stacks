@@ -168,6 +168,54 @@ run_logged() {
     return "$rc"
 }
 
+# Build a JSON array of strings from the arguments
+json_str_array() {
+    local out="" s
+    for s in "$@"; do
+        out+=",\"$(json_escape "$s")\""
+    done
+    printf '[%s]' "${out#,}"
+}
+
+# find_outdated_containers STACK_NAME CONTEXT_ARRAY_NAME
+# Run inside a stack dir after a pull. Compares the image each running container was
+# started from with the image its tag now points to, and logs the containers that differ.
+# Sets OUTDATED_CONTAINERS to the names of the containers needing an update.
+find_outdated_containers() {
+    local stack=$1
+    local -n ctx_ref="$2"
+    OUTDATED_CONTAINERS=()
+
+    local entries="" cid name ref running_id latest_id
+    while IFS= read -r cid; do
+        [ -n "$cid" ] || continue
+        IFS='|' read -r name ref running_id \
+            < <(docker inspect -f '{{.Name}}|{{.Config.Image}}|{{.Image}}' "$cid" 2>/dev/null < /dev/null)
+        name=${name#/}
+        latest_id=$(docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null < /dev/null)
+
+        if [ -n "$latest_id" ] && [ "$latest_id" != "$running_id" ]; then
+            OUTDATED_CONTAINERS+=("$name")
+            entries+=",$(json_obj "container=$name" "image=$ref" \
+                "runningImageId=${running_id#sha256:}" "latestImageId=${latest_id#sha256:}")"
+        fi
+    done < <(docker compose ps -q 2>/dev/null < /dev/null)
+
+    local count=${#OUTDATED_CONTAINERS[@]}
+    local payload
+    payload=$(json_obj "${ctx_ref[@]}" \
+        "containersNeedingUpdateCount:=$count" \
+        "containersNeedingUpdate:=[${entries#,}]")
+
+    if [ "$count" -gt 0 ]; then
+        local joined
+        printf -v joined '%s, ' "${OUTDATED_CONTAINERS[@]}"
+        log_event INFO "Stack ${stack}: ${count} container(s) need updating: ${joined%, }" "$payload"
+    else
+        log_event INFO "Stack ${stack}: all containers up to date" "$payload"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -194,6 +242,8 @@ fi
 stacks_total=0
 stacks_ok=0
 failed_stacks=()
+stacks_needing_update=()
+updates_json=""    # "stack":["container",...] pairs for the summary
 
 # Each running compose project is one {...} object in the JSON array
 while IFS= read -r entry; do
@@ -225,7 +275,9 @@ while IFS= read -r entry; do
         continue
     fi
 
+    OUTDATED_CONTAINERS=()
     if run_logged "PullFailed" "Image pull for ${project}" stack_ctx -- docker compose --ansi never pull \
+        && find_outdated_containers "$project" stack_ctx \
         && run_logged "DeployFailed" "Deploy of ${project}" stack_ctx -- docker compose --ansi never up -d; then
         stacks_ok=$((stacks_ok + 1))
         stack_status="success"
@@ -236,8 +288,14 @@ while IFS= read -r entry; do
         stack_severity=ERROR
     fi
 
+    if [ "${#OUTDATED_CONTAINERS[@]}" -gt 0 ]; then
+        stacks_needing_update+=("$project")
+        updates_json+=",\"$(json_escape "$project")\":$(json_str_array "${OUTDATED_CONTAINERS[@]}")"
+    fi
+
     log_event "$stack_severity" "Stack ${project} finished: ${stack_status}" "$(json_obj "${stack_ctx[@]}" \
         "status=$stack_status" \
+        "containersNeedingUpdate:=$(json_str_array "${OUTDATED_CONTAINERS[@]}")" \
         "durationMs:=$(( $(now_ms) - stack_start ))")" \
         "$([ "$stack_status" = failed ] && echo StackUpdateFailed)"
 
@@ -250,12 +308,15 @@ prune_ctx=("host=$HOST")
 run_logged "PruneFailed" "Image cleanup" prune_ctx -- docker image prune -f
 end_span
 
-# Build a JSON array of failed stack names for the summary
-failed_json=""
-for s in "${failed_stacks[@]}"; do
-    failed_json+=",\"$(json_escape "$s")\""
-done
-failed_json="[${failed_json#,}]"
+if [ "${#stacks_needing_update[@]}" -gt 0 ]; then
+    printf -v updated_list '%s, ' "${stacks_needing_update[@]}"
+    log_event INFO "Stacks with updates: ${updated_list%, }" "$(json_obj \
+        "host=$HOST" \
+        "stacksNeedingUpdateCount:=${#stacks_needing_update[@]}" \
+        "stacksNeedingUpdate:={${updates_json#,}}")"
+else
+    log_event INFO "No stacks had updates available" "$(json_obj "host=$HOST" "stacksNeedingUpdateCount:=0")"
+fi
 
 if [ "${#failed_stacks[@]}" -eq 0 ]; then
     summary_severity=INFO
@@ -266,13 +327,14 @@ else
 fi
 
 log_event "$summary_severity" \
-    "Run completed on ${HOST}: ${stacks_ok}/${stacks_total} stacks updated, ${#failed_stacks[@]} failed" \
+    "Run completed on ${HOST}: ${stacks_ok}/${stacks_total} stacks processed, ${#stacks_needing_update[@]} had updates, ${#failed_stacks[@]} failed" \
     "$(json_obj \
         "host=$HOST" \
         "stacksTotal:=$stacks_total" \
         "stacksSucceeded:=$stacks_ok" \
         "stacksFailed:=${#failed_stacks[@]}" \
-        "failedStacks:=$failed_json" \
+        "failedStacks:=$(json_str_array "${failed_stacks[@]}")" \
+        "stacksNeedingUpdate:={${updates_json#,}}" \
         "durationMs:=$(( $(now_ms) - RUN_START ))")" \
     "$summary_type"
 console "Trace ID: ${TRACE_ID}"
